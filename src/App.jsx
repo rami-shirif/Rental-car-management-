@@ -1,0 +1,420 @@
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  connectFirebase,
+  readCollection,
+  writeItem,
+  deleteItem,
+} from "./firebase";
+import "./styles.css";
+
+const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const DAY_MS = 86400000;
+const money = (n) => `${Number(n || 0).toLocaleString("en-US", { maximumFractionDigits: 2 })} MAD`;
+const dateText = (value) => new Date(value).toLocaleDateString("en-GB", {
+  day: "2-digit", month: "short", year: "numeric"
+});
+const dateTimeText = (value) => new Date(value).toLocaleString("en-GB", {
+  day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit"
+});
+
+function endDate(rental) {
+  return new Date(new Date(rental.startDate).getTime() + Number(rental.days) * DAY_MS);
+}
+function daysLeft(rental) {
+  return Math.ceil((endDate(rental).getTime() - Date.now()) / DAY_MS);
+}
+
+export default function App() {
+  const [cars, setCars] = useState([]);
+  const [rentals, setRentals] = useState([]);
+  const [tab, setTab] = useState("dashboard");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [toast, setToast] = useState("");
+  const [contractRental, setContractRental] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await connectFirebase();
+        const [carsData, rentalsData] = await Promise.all([
+          readCollection("cars"),
+          readCollection("rentals"),
+        ]);
+        setCars(Object.values(carsData || {}));
+        setRentals(Object.values(rentalsData || {}));
+      } catch (error) {
+        console.error(error);
+        notify("Firebase connection failed. Check Anonymous Auth and database rules.");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  function notify(message) {
+    setToast(message);
+    window.clearTimeout(window.__fleetToast);
+    window.__fleetToast = window.setTimeout(() => setToast(""), 2800);
+  }
+
+  async function persist(path, id, value) {
+    setSaving(true);
+    try {
+      await writeItem(path, id, value);
+    } catch (error) {
+      console.error(error);
+      notify("Could not save to Firebase.");
+      throw error;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addCar(data) {
+    const car = { id: uid(), status: "available", createdAt: new Date().toISOString(), ...data };
+    try {
+      await persist("cars", car.id, car);
+      setCars((prev) => [...prev, car]);
+      notify(`${car.name} added to the fleet`);
+    } catch {}
+  }
+
+  async function deleteCar(id) {
+    if (rentals.some((r) => r.carId === id && !r.returned)) {
+      notify("Can't remove a car that is currently rented.");
+      return;
+    }
+    try {
+      await deleteItem("cars", id);
+      setCars((prev) => prev.filter((c) => c.id !== id));
+      notify("Car removed.");
+    } catch {
+      notify("Could not remove car.");
+    }
+  }
+
+  async function addRental(data) {
+    const rental = {
+      id: uid(),
+      returned: false,
+      createdAt: new Date().toISOString(),
+      ...data,
+    };
+    const car = cars.find((c) => c.id === rental.carId);
+    if (!car) return;
+
+    try {
+      await Promise.all([
+        persist("rentals", rental.id, rental),
+        persist("cars", car.id, { ...car, status: "rented" }),
+      ]);
+      setRentals((prev) => [...prev, rental]);
+      setCars((prev) => prev.map((c) => c.id === car.id ? { ...c, status: "rented" } : c));
+      notify(`Rental started for ${rental.customerName}`);
+      setContractRental(rental);
+    } catch {}
+  }
+
+  async function returnRental(id) {
+    const rental = rentals.find((r) => r.id === id);
+    if (!rental) return;
+    const car = cars.find((c) => c.id === rental.carId);
+    const updatedRental = { ...rental, returned: true, returnedAt: new Date().toISOString() };
+    try {
+      await persist("rentals", id, updatedRental);
+      if (car) await persist("cars", car.id, { ...car, status: "available" });
+      setRentals((prev) => prev.map((r) => r.id === id ? updatedRental : r));
+      setCars((prev) => prev.map((c) => c.id === rental.carId ? { ...c, status: "available" } : c));
+      notify("Car marked as returned.");
+    } catch {}
+  }
+
+  const stats = useMemo(() => {
+    const active = rentals.filter((r) => !r.returned);
+    return {
+      total: cars.length,
+      available: cars.filter((c) => c.status === "available").length,
+      rented: cars.filter((c) => c.status === "rented").length,
+      overdue: active.filter((r) => daysLeft(r) < 0).length,
+      revenue: rentals.reduce((sum, r) => sum + Number(r.days || 0) * Number(r.pricePerDay || 0), 0),
+      active,
+    };
+  }, [cars, rentals]);
+
+  if (loading) return <div className="loading">Connecting to Firebase…</div>;
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand"><span className="brand-mark">◍</span> Rental Cars Manager</div>
+        <nav>
+          {[
+            ["dashboard", "Overview"], ["fleet", "Fleet"], ["rentals", "Rentals"], ["availability", "Availability"]
+          ].map(([id, label]) => (
+            <button key={id} className={tab === id ? "nav active" : "nav"} onClick={() => setTab(id)}>
+              {label}
+            </button>
+          ))}
+        </nav>
+        <div className="cloud-status"><span className="online-dot" /> Firebase connected</div>
+      </aside>
+
+      <main className="main">
+        <header className="topbar">
+          <div>
+            <div className="eyebrow">FLEET MANAGEMENT</div>
+            <h1>{tab === "dashboard" ? "Overview" : tab[0].toUpperCase() + tab.slice(1)}</h1>
+          </div>
+          <div className="stats">
+            <Stat label="Cars" value={stats.total} />
+            <Stat label="Available" value={stats.available} cls="teal" />
+            <Stat label="Rented" value={stats.rented} cls="amber" />
+            <Stat label="Revenue" value={money(stats.revenue)} />
+          </div>
+        </header>
+
+        <div className="content">
+          {tab === "dashboard" && <Dashboard stats={stats} cars={cars} onReturn={returnRental} onContract={setContractRental} />}
+          {tab === "fleet" && <Fleet cars={cars} rentals={rentals} onAdd={addCar} onDelete={deleteCar} />}
+          {tab === "rentals" && <Rentals cars={cars} rentals={rentals} onAdd={addRental} onReturn={returnRental} onContract={setContractRental} />}
+          {tab === "availability" && <Availability cars={cars} rentals={rentals} />}
+        </div>
+      </main>
+
+      {saving && <div className="saving">Saving…</div>}
+      {toast && <div className="toast">{toast}</div>}
+      {contractRental && (
+        <ContractModal
+          rental={contractRental}
+          car={cars.find((c) => c.id === contractRental.carId)}
+          onClose={() => setContractRental(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, cls = "" }) {
+  return <div className={`stat ${cls}`}><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function Dashboard({ stats, cars, onReturn, onContract }) {
+  const upcoming = [...stats.active].sort((a, b) => daysLeft(a) - daysLeft(b)).slice(0, 6);
+  return (
+    <div className="grid">
+      <section className="panel">
+        <div className="panel-head"><h2>Due back soon</h2><span>{stats.overdue} overdue</span></div>
+        {upcoming.length === 0 ? <Empty text="No active rentals right now." /> : (
+          <div className="list">
+            {upcoming.map((r) => {
+              const car = cars.find((c) => c.id === r.carId);
+              const left = daysLeft(r);
+              return <div className="list-row" key={r.id}>
+                <div><b>{car ? `${car.name} · ${car.model}` : "Unknown car"}</b><small>{r.customerName} · CIN {r.cin}</small></div>
+                <span className={`pill ${left < 0 ? "danger" : ""}`}>{left < 0 ? `${Math.abs(left)}d overdue` : `${left}d left`}</span>
+                <button className="ghost" onClick={() => onContract(r)}>Contract</button>
+                <button className="ghost" onClick={() => onReturn(r.id)}>Return</button>
+              </div>;
+            })}
+          </div>
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head"><h2>At a glance</h2></div>
+        <div className="glance">
+          <div><strong>{stats.available}</strong><span>ready to rent</span></div>
+          <div><strong>{stats.rented}</strong><span>with customers</span></div>
+          <div><strong className={stats.overdue ? "danger-text" : ""}>{stats.overdue}</strong><span>overdue returns</span></div>
+          <div><strong>{money(stats.revenue)}</strong><span>lifetime revenue</span></div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function Fleet({ cars, rentals, onAdd, onDelete }) {
+  const [form, setForm] = useState({ name: "", model: "", pricePerDay: "", plate: "", color: "" });
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!form.name.trim() || !form.model.trim() || Number(form.pricePerDay) <= 0) return;
+    await onAdd({ ...form, name: form.name.trim(), model: form.model.trim(), pricePerDay: Number(form.pricePerDay) });
+    setForm({ name: "", model: "", pricePerDay: "", plate: "", color: "" });
+  };
+  return <div className="grid">
+    <section className="panel">
+      <h2>Add a car</h2>
+      <form className="form" onSubmit={submit}>
+        <Field label="Make / name" value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="e.g. Volkswagen Golf" />
+        <Field label="Model / trim" value={form.model} onChange={(v) => setForm({ ...form, model: v })} placeholder="e.g. 7 GTI 2022" />
+        <Field label="License plate" value={form.plate} onChange={(v) => setForm({ ...form, plate: v })} placeholder="e.g. 12345-A-6" />
+        <Field label="Color" value={form.color} onChange={(v) => setForm({ ...form, color: v })} placeholder="e.g. Black" />
+        <Field label="Price per day (MAD)" type="number" value={form.pricePerDay} onChange={(v) => setForm({ ...form, pricePerDay: v })} placeholder="350" />
+        <button className="primary">Add car</button>
+      </form>
+    </section>
+    <section className="panel">
+      <div className="panel-head"><h2>Fleet ({cars.length})</h2></div>
+      {cars.length === 0 ? <Empty text="No cars yet." /> : <div className="cards">
+        {cars.map((c) => {
+          const active = rentals.find((r) => r.carId === c.id && !r.returned);
+          return <article className="car-card" key={c.id}>
+            <div className="car-top"><div><b>{c.name}</b><small>{c.model}</small></div><span className={`status ${c.status}`} /></div>
+            <div className="car-meta">{c.plate || "No plate"} {c.color ? `· ${c.color}` : ""}</div>
+            <div className="price">{money(c.pricePerDay)}<small>/day</small></div>
+            {active && <div className="rented-note">With {active.customerName} · {daysLeft(active)}d left</div>}
+            <button className="ghost" onClick={() => onDelete(c.id)}>Remove</button>
+          </article>;
+        })}
+      </div>}
+    </section>
+  </div>;
+}
+
+function Rentals({ cars, rentals, onAdd, onReturn, onContract }) {
+  const available = cars.filter((c) => c.status === "available");
+  const [form, setForm] = useState({ carId: "", customerName: "", cin: "", phone: "", days: 1 });
+  const car = cars.find((c) => c.id === form.carId);
+  const total = car ? Number(car.pricePerDay) * Number(form.days || 0) : 0;
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!car || !form.customerName.trim() || !form.cin.trim() || Number(form.days) <= 0) return;
+    await onAdd({
+      carId: car.id,
+      customerName: form.customerName.trim(),
+      cin: form.cin.trim(),
+      phone: form.phone.trim(),
+      days: Number(form.days),
+      pricePerDay: Number(car.pricePerDay),
+      totalPrice: total,
+      startDate: new Date().toISOString(),
+    });
+    setForm({ carId: "", customerName: "", cin: "", phone: "", days: 1 });
+  }
+
+  const active = rentals.filter((r) => !r.returned);
+  const history = [...rentals].filter((r) => r.returned).reverse();
+
+  return <div className="grid">
+    <section className="panel">
+      <h2>New rental</h2>
+      <form className="form" onSubmit={submit}>
+        <label>Car<select value={form.carId} onChange={(e) => setForm({ ...form, carId: e.target.value })}>
+          <option value="">Select available car</option>
+          {available.map((c) => <option key={c.id} value={c.id}>{c.name} · {c.model} · {money(c.pricePerDay)}/day</option>)}
+        </select></label>
+        <Field label="Customer name" value={form.customerName} onChange={(v) => setForm({ ...form, customerName: v })} placeholder="Full name" />
+        <Field label="CIN / ID" value={form.cin} onChange={(v) => setForm({ ...form, cin: v })} placeholder="ID number" />
+        <Field label="Phone" value={form.phone} onChange={(v) => setForm({ ...form, phone: v })} placeholder="+212 ..." />
+        <Field label="Rental days" type="number" value={form.days} onChange={(v) => setForm({ ...form, days: v })} />
+        <div className="total"><span>Total price</span><strong>{money(total)}</strong></div>
+        <button className="primary" disabled={!available.length}>{available.length ? "Start rental" : "No cars available"}</button>
+      </form>
+    </section>
+
+    <section className="panel">
+      <div className="panel-head"><h2>Active rentals ({active.length})</h2></div>
+      {active.length === 0 ? <Empty text="No active rentals." /> : <div className="list">
+        {active.map((r) => {
+          const c = cars.find((x) => x.id === r.carId);
+          const left = daysLeft(r);
+          return <div className="rental-row" key={r.id}>
+            <div className="rental-main">
+              <b>{r.customerName}</b>
+              <small>{c ? `${c.name} · ${c.model}` : "Unknown car"} · CIN {r.cin}</small>
+              <small>{dateText(r.startDate)} → {dateText(endDate(r))} · {money(r.totalPrice || r.days * r.pricePerDay)}</small>
+            </div>
+            <span className={`pill ${left < 0 ? "danger" : ""}`}>{left < 0 ? `${Math.abs(left)}d overdue` : `${left}d left`}</span>
+            <button className="ghost" onClick={() => onContract(r)}>Contract</button>
+            <button className="ghost" onClick={() => onReturn(r.id)}>Return</button>
+          </div>;
+        })}
+      </div>}
+      {history.length > 0 && <><h2 className="history-title">Rental history ({history.length})</h2><div className="list">
+        {history.slice(0, 10).map((r) => <div className="rental-row muted" key={r.id}>
+          <div className="rental-main"><b>{r.customerName}</b><small>{cars.find((c) => c.id === r.carId)?.name || "Unknown car"} · {money(r.totalPrice || r.days * r.pricePerDay)}</small><small>Returned {dateTimeText(r.returnedAt)}</small></div>
+          <span className="pill returned">Returned</span><button className="ghost" onClick={() => onContract(r)}>Contract</button>
+        </div>)}
+      </div></>}
+    </section>
+  </div>;
+}
+
+function Availability({ cars, rentals }) {
+  return <section className="panel">
+    <div className="panel-head"><h2>Vehicle availability</h2><span>{cars.length} cars</span></div>
+    <div className="availability">
+      {cars.map((c) => {
+        const r = rentals.find((x) => x.carId === c.id && !x.returned);
+        const left = r ? daysLeft(r) : null;
+        return <div className="availability-row" key={c.id}>
+          <div className={`status ${c.status}`} />
+          <div className="avail-name"><b>{c.name} · {c.model}</b><small>{r ? `${r.customerName} · returns ${dateText(endDate(r))}` : `Ready · ${money(c.pricePerDay)}/day`}</small></div>
+          <div className="bar"><i style={{ width: r ? `${Math.max(5, Math.min(100, (left / r.days) * 100))}%` : "100%" }} /></div>
+          <span className={`pill ${left !== null && left < 0 ? "danger" : ""}`}>{r ? (left < 0 ? `${Math.abs(left)}d overdue` : `${left}d left`) : "Available"}</span>
+        </div>;
+      })}
+    </div>
+  </section>;
+}
+
+function ContractModal({ rental, car, onClose }) {
+  return <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="contract-modal">
+      <div className="modal-actions">
+        <button className="ghost" onClick={onClose}>Close</button>
+        <button className="primary" onClick={() => window.print()}>Print contract</button>
+      </div>
+      <div className="contract" id="print-contract">
+        <header className="contract-header">
+          <div><div className="contract-logo">RENTAL CARS</div><small>Vehicle Rental Agreement</small></div>
+          <div className="contract-number">Contract #{rental.id.slice(-8).toUpperCase()}</div>
+        </header>
+        <div className="contract-title"><h1>CAR RENTAL CONTRACT</h1><p>Agreement date: {dateText(rental.startDate)}</p></div>
+        <div className="contract-grid">
+          <Info title="CUSTOMER" rows={[
+            ["Full name", rental.customerName], ["CIN / ID", rental.cin], ["Phone", rental.phone || "—"]
+          ]}/>
+          <Info title="VEHICLE" rows={[
+            ["Vehicle", car ? `${car.name} ${car.model}` : "—"], ["Plate", car?.plate || "—"], ["Color", car?.color || "—"]
+          ]}/>
+        </div>
+        <div className="contract-grid">
+          <Info title="RENTAL PERIOD" rows={[
+            ["Start", dateTimeText(rental.startDate)], ["Return", dateTimeText(endDate(rental))], ["Duration", `${rental.days} day(s)`]
+          ]}/>
+          <Info title="PAYMENT" rows={[
+            ["Daily rate", money(rental.pricePerDay)], ["Total", money(rental.totalPrice || rental.days * rental.pricePerDay)], ["Status", rental.returned ? "Completed" : "Active"]
+          ]}/>
+        </div>
+        <div className="terms">
+          <h3>Terms & Conditions</h3>
+          <ol>
+            <li>The customer confirms receipt of the vehicle in good rental condition unless noted separately.</li>
+            <li>The vehicle must be returned on the agreed date and time.</li>
+            <li>The customer is responsible for fines, damage caused by misuse, and unauthorized use.</li>
+            <li>Any extension must be agreed with the rental agency before the original return time.</li>
+          </ol>
+        </div>
+        <div className="inspection">
+          <h3>Vehicle condition / notes</h3>
+          <div className="line" /><div className="line" /><div className="line" />
+        </div>
+        <div className="signatures">
+          <div><span>Customer signature</span><div /></div>
+          <div><span>Agency representative</span><div /></div>
+        </div>
+        <footer>Generated from Rental Cars Manager · {dateTimeText(new Date())}</footer>
+      </div>
+    </div>
+  </div>;
+}
+
+function Info({ title, rows }) {
+  return <div className="info-box"><h3>{title}</h3>{rows.map(([a,b]) => <div className="info-row" key={a}><span>{a}</span><b>{b}</b></div>)}</div>;
+}
+function Field({ label, value, onChange, type = "text", placeholder = "" }) {
+  return <label>{label}<input type={type} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} /></label>;
+}
+function Empty({ text }) { return <div className="empty">{text}</div>; }
