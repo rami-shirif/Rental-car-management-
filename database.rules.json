@@ -1,0 +1,16 @@
+{
+  "rules": {
+    ".read": "auth != null",
+    ".write": "auth != null",
+    "cars": {
+      "$carId": {
+        ".validate": "newData.hasChildren(['id','name','model','pricePerDay','status'])"
+      }
+    },
+    "rentals": {
+      "$rentalId": {
+        ".validate": "newData.hasChildren(['id','carId','customerName','cin','days','pricePerDay','startDate','returned'])"
+      }
+    }
+  }
+}
